@@ -3,8 +3,10 @@
 #include <immintrin.h>
 #include <cstdint>
 #include <cstring>
-#include <bit> 
-
+#include <bit>
+#include <chrono> 
+#include <iostream>
+#include <iomanip> 
 
 namespace {
 
@@ -86,12 +88,12 @@ namespace {
         }
     };
 
-    
+
     inline void EnsureTablesInitialized() {
         static SM4_TableInitializer initializer;
     }
 
-} 
+}
 
 // SM4 密钥结构体
 struct SM4_Key {
@@ -107,7 +109,7 @@ struct SM4_Key {
 inline int SM4_KeyInit(const uint8_t* key, SM4_Key* sm4_key) noexcept {
     if (!key || !sm4_key) return -1;
 
-    
+
     EnsureTablesInitialized();
 
     // 加载主密钥
@@ -144,6 +146,59 @@ inline int SM4_KeyInit(const uint8_t* key, SM4_Key* sm4_key) noexcept {
     return 0;
 }
 
+//  基本实现 (非SIMD) 
+inline void SM4_Encrypt_Block(const uint8_t* plaintext, uint8_t* ciphertext, const SM4_Key* sm4_key) noexcept {
+    // 确保查找表已初始化
+    EnsureTablesInitialized();
+
+    // 加载明文块
+    uint32_t X[4];
+    memcpy(X, plaintext, 16);
+
+    // 32轮Feistel迭代
+    for (int r = 0; r < 32; r++) {
+        uint32_t tmp = X[1] ^ X[2] ^ X[3] ^ sm4_key->rk[r];
+
+        // T变换
+        tmp = T_table[0][(tmp >> 24) & 0xFF] ^
+            T_table[1][(tmp >> 16) & 0xFF] ^
+            T_table[2][(tmp >> 8) & 0xFF] ^
+            T_table[3][tmp & 0xFF];
+
+        // 更新状态
+        uint32_t new_X3 = X[0] ^ tmp;
+
+        // 移位寄存器
+        X[0] = X[1];
+        X[1] = X[2];
+        X[2] = X[3];
+        X[3] = new_X3;
+    }
+
+    // 最终反序
+    uint32_t temp = X[0];
+    X[0] = X[3];
+    X[3] = temp;
+    temp = X[1];
+    X[1] = X[2];
+    X[2] = temp;
+
+    // 写回密文
+    memcpy(ciphertext, X, 16);
+}
+
+inline void SM4_Decrypt_Block(const uint8_t* ciphertext, uint8_t* plaintext, const SM4_Key* sm4_key) noexcept {
+    // 创建逆序轮密钥
+    SM4_Key reversed_key;
+    for (int i = 0; i < 32; i++) {
+        reversed_key.rk[i] = sm4_key->rk[31 - i];
+    }
+
+    // 使用相同的加密流程
+    SM4_Encrypt_Block(ciphertext, plaintext, &reversed_key);
+}
+
+// SIMD优化实现
 // SIMD T_transform 函数 (AVX2 实现)
 inline __m256i T_transform(__m256i input) noexcept {
     const __m256i mask = _mm256_set1_epi32(0xFF);
@@ -231,7 +286,7 @@ inline void SM4_Encrypt_x8(const uint8_t* plaintext,
 inline void SM4_Decrypt_x8(const uint8_t* ciphertext,
     uint8_t* plaintext,
     const SM4_Key* sm4_key) noexcept {
-    
+    // 确保查找表已初始化
     EnsureTablesInitialized();
 
     // 创建逆序轮密钥
@@ -242,6 +297,43 @@ inline void SM4_Decrypt_x8(const uint8_t* ciphertext,
 
     // 使用相同的加密流程
     SM4_Encrypt_x8(ciphertext, plaintext, &reversed_key);
+}
+
+// 性能测试函数 
+template <typename Func>
+double benchmark_sm4(Func encrypt_func, const char* name,
+    const uint8_t* data, size_t data_size,
+    const SM4_Key* key, int blocks_per_call) {
+    uint8_t* output = new uint8_t[data_size];
+
+    // 预热缓存
+    encrypt_func(data, output, key);
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // 执行加密操作
+    const size_t num_blocks = data_size / (16 * blocks_per_call);
+    for (size_t i = 0; i < num_blocks; i++) {
+        encrypt_func(data + i * 16 * blocks_per_call,
+            output + i * 16 * blocks_per_call,
+            key);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    double time_used = elapsed.count();
+
+    // 计算吞吐量
+    double total_bytes = static_cast<double>(num_blocks * 16 * blocks_per_call);
+    double speed_mbs = (total_bytes / (1024.0 * 1024.0)) / time_used;
+
+    // 输出结果
+    std::cout << name << ": " << std::fixed << std::setprecision(2)
+        << speed_mbs << " MB/s ("
+        << (speed_mbs * 8) << " Mbps)\n";
+
+    delete[] output;
+    return speed_mbs;
 }
 
 // 密钥删除 (安全清零)
